@@ -60,21 +60,39 @@ export async function main(ns) {
       if (secNow <= secMin + 0.5 && moneyNow >= moneyMax * 0.99) return;
 
       const hosts = getHosts();
+      if (hosts.length === 0) {
+        const pausedNow = [...getPausedHosts()];
+        const assignedPaused = hostNames.filter(h => pausedNow.includes(h));
+        ns.print(
+          `[prep] WARNING: 0 usable hosts (assigned: ${hostNames.length}, ` +
+          `currently paused: ${assignedPaused.length > 0 ? assignedPaused.join(", ") : "none"}). ` +
+          `Nothing will dispatch until this changes.`
+        );
+        await ns.sleep(5000);
+        continue;
+      }
+
       const mode = secNow > secMin + 0.5 ? "weaken" : "grow";
       if (mode === "weaken") {
         const threads = Math.floor(totalRam(hosts) / weakenRam);
         execDistributed(scripts.weaken, target, 0, threads, hosts);
-        ns.print(`[prep] weakening: ${threads} threads (sec ${secNow.toFixed(1)}/${secMin.toFixed(1)})`);
+        ns.print(`[prep] weakening: ${threads} threads on ${hosts.length} hosts (${ns.format.number(totalRam(hosts))}GB free) (sec ${secNow.toFixed(1)}/${secMin.toFixed(1)})`);
       } else {
         const ratio = ns.growthAnalyzeSecurity(1) / ns.weakenAnalyze(1);
         const growThreads = Math.floor(totalRam(hosts) / (growRam + ratio * weakenRam));
         const weakenThreads = Math.ceil(growThreads * ratio);
         execDistributed(scripts.grow, target, 0, growThreads, hosts);
         execDistributed(scripts.weaken, target, 0, weakenThreads, hosts);
-        ns.print(`[prep] growing: ${growThreads} grow + ${weakenThreads} stabilizing weaken`);
+        ns.print(`[prep] growing: ${growThreads} grow + ${weakenThreads} stabilizing weaken on ${hosts.length} hosts`);
       }
       await ns.sleep(ns.getWeakenTime(target) + 200);
     }
+  }
+
+  ns.print(`Worker starting for ${target} — assigned ${hostNames.length} host(s): ${hostNames.join(", ") || "(none!)"}`);
+  if (hostNames.length === 0) {
+    ns.print(`No hosts were assigned to this target at launch — nothing to do. Exiting.`);
+    return;
   }
 
   await prep();
@@ -141,24 +159,34 @@ export async function main(ns) {
 
   while (true) {
     const hosts = getHosts();
+    const availNow = totalRam(hosts);
 
-    if (totalRam(hosts) >= ramPerBatch) {
+    if (availNow >= ramPerBatch) {
       const weaken1Delay = 0;
       const weaken2Delay = 2 * SPACING;
       const hackDelay = Math.max(0, weakenTime - SPACING - hackTime);
       const growDelay = Math.max(0, weakenTime + SPACING - growTime);
 
-      execDistributed(scripts.hack, target, hackDelay, hackThreads, hosts);
-      execDistributed(scripts.weaken, target, weaken1Delay, weaken1Threads, hosts);
-      execDistributed(scripts.grow, target, growDelay, growThreads, hosts);
-      execDistributed(scripts.weaken, target, weaken2Delay, weaken2Threads, hosts);
+      const gotHack = execDistributed(scripts.hack, target, hackDelay, hackThreads, hosts);
+      const gotW1 = execDistributed(scripts.weaken, target, weaken1Delay, weaken1Threads, hosts);
+      const gotGrow = execDistributed(scripts.grow, target, growDelay, growThreads, hosts);
+      const gotW2 = execDistributed(scripts.weaken, target, weaken2Delay, weaken2Threads, hosts);
 
       batchCount++;
-      if (batchCount % 25 === 0) {
-        ns.print(`${target}: ${batchCount} batches launched so far (${skipped} skipped for RAM).`);
-      }
+      const shortfall = gotHack < hackThreads || gotW1 < weaken1Threads || gotGrow < growThreads || gotW2 < weaken2Threads;
+      const secNow = ns.getServerSecurityLevel(target);
+      const moneyNow = ns.getServerMoneyAvailable(target);
+      const moneyMax = ns.getServerMaxMoney(target);
+
+      ns.print(
+        `${target} #${batchCount}: dispatched hack=${gotHack}/${hackThreads} w1=${gotW1}/${weaken1Threads} ` +
+        `grow=${gotGrow}/${growThreads} w2=${gotW2}/${weaken2Threads}` +
+        (shortfall ? " [SHORTFALL — RAM ran out mid-dispatch]" : "") +
+        ` | sec=${secNow.toFixed(1)} money=${ns.format.number(moneyNow)}/${ns.format.number(moneyMax)}`
+      );
     } else {
       skipped++;
+      ns.print(`${target}: skipped batch #${batchCount + skipped} — only ${ns.format.number(availNow)}GB free, need ${ns.format.number(ramPerBatch)}GB.`);
     }
 
     await ns.sleep(period);

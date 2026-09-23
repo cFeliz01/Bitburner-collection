@@ -3,7 +3,10 @@ export async function main(ns) {
   ns.disableLog("ALL");
 
   const explicitTarget = ns.args[0] || null;
-  const HOME_RESERVE_RAM = 128; // headroom for many more worker processes now running on home
+  // Scales with home's actual RAM instead of a fixed number — 128 was fine for an
+  // endgame save with huge home RAM, but would leave negative available RAM (and
+  // zero threads dispatched everywhere) on a fresh/early-game save with small home.
+  const HOME_RESERVE_RAM = Math.min(128, Math.max(8, ns.getServerMaxRam("home") * 0.1));
   const MAX_PARALLEL_TARGETS = 40; // spread across far more targets — one target can't absorb this much RAM
   const FEASIBLE_CYCLE_CAP = 50;
 
@@ -82,14 +85,17 @@ export async function main(ns) {
     if (ns.getServerMaxRam(s) > 0) await ns.scp(Object.values(scripts), s);
   }
 
-  // Hosts available to hand out to workers — home is excluded from the hacking pool
-  // since home itself runs the worker processes.
-  const hosts = rootedServers
+  // Hosts available to hand out to workers, excluding home for now — we fold its
+  // spare capacity back in below, split into chunks, AFTER targets are selected,
+  // so it distributes across the target list instead of going to just one target
+  // or (as before) sitting completely unused.
+  const nonHomeHosts = rootedServers
     .filter(s => s !== "home" && ns.getServerMaxRam(s) > 0)
     .map(s => ({ host: s, ram: ns.getServerMaxRam(s) }))
     .sort((a, b) => b.ram - a.ram);
 
-  const threadBudget = estimateThreadBudget(hosts);
+  const homeAvailRam = Math.max(0, ns.getServerMaxRam("home") - HOME_RESERVE_RAM);
+  const threadBudget = estimateThreadBudget([...nonHomeHosts, { host: "home", ram: homeAvailRam }]);
 
   let selected;
   if (explicitTarget) {
@@ -108,6 +114,19 @@ export async function main(ns) {
     }
     selected = top.map(c => ({ s: c.s, weight: c.score }));
   }
+
+  // Split home's spare RAM into one chunk per selected target (capped at 20 chunks)
+  // so the greedy assignment below spreads it across multiple targets rather than
+  // handing the whole thing to just whichever target it lands on first.
+  const homeChunks = Math.min(selected.length, 20);
+  const homeChunkRam = homeChunks > 0 ? homeAvailRam / homeChunks : 0;
+  const hosts = [...nonHomeHosts];
+  if (homeChunkRam > 0.01) {
+    for (let i = 0; i < homeChunks; i++) {
+      hosts.push({ host: "home", ram: homeChunkRam });
+    }
+  }
+  hosts.sort((a, b) => b.ram - a.ram);
 
   // Greedily assign whole hosts to whichever selected target currently has the
   // lowest (RAM assigned so far / its score weight) — keeps allocation roughly
@@ -130,7 +149,7 @@ export async function main(ns) {
 
   for (let i = 0; i < selected.length; i++) {
     const target = selected[i].s;
-    const hostList = hostGroups[i];
+    const hostList = [...new Set(hostGroups[i])]; // dedupe — "home" may appear as multiple chunks
     if (hostList.length === 0) {
       ns.print(`Skipping ${target} — no hosts assigned.`);
       continue;
